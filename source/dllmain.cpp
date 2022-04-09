@@ -16,15 +16,22 @@
 
 #include "d3d8.h"
 
+#pragma comment(lib, "winmm.lib") // needed for timeBeginPeriod()/timeEndPeriod()
+
 Direct3D8EnableMaximizedWindowedModeShimProc m_pDirect3D8EnableMaximizedWindowedModeShim;
 ValidatePixelShaderProc m_pValidatePixelShader;
 ValidateVertexShaderProc m_pValidateVertexShader;
 DebugSetMuteProc m_pDebugSetMute;
 Direct3DCreate8Proc m_pDirect3DCreate8;
 
+HWND g_hFocusWindow = NULL;
+
 bool bForceWindowedMode;
 bool bDirect3D8DisableMaximizedWindowedModeShim;
-bool bFPSLimit;
+bool bUsePrimaryMonitor;
+bool bCenterWindow;
+bool bBorderlessFullscreen;
+bool bAlwaysOnTop;
 float fFPSLimit;
 
 class FrameLimiter
@@ -32,19 +39,29 @@ class FrameLimiter
 private:
 	static inline double TIME_Frequency = 0.0;
 	static inline double TIME_Ticks = 0.0;
+	static inline double TIME_Frametime = 0.0;
 
 public:
-	static void Init()
+	enum FPSLimitMode { FPS_NONE, FPS_REALTIME, FPS_ACCURATE };
+	static void Init(FPSLimitMode mode)
 	{
 		LARGE_INTEGER frequency;
 
 		QueryPerformanceFrequency(&frequency);
 		static constexpr auto TICKS_PER_FRAME = 1;
 		auto TICKS_PER_SECOND = (TICKS_PER_FRAME * fFPSLimit);
-		TIME_Frequency = (double)frequency.QuadPart / (double)TICKS_PER_SECOND;
+		if (mode == FPS_ACCURATE)
+		{
+			TIME_Frametime = 1000.0 / (double)fFPSLimit;
+			TIME_Frequency = (double)frequency.QuadPart / 1000.0; // ticks are milliseconds
+		}
+		else // FPS_REALTIME
+		{
+			TIME_Frequency = (double)frequency.QuadPart / (double)TICKS_PER_SECOND; // ticks are 1/n frames (n = fFPSLimit)
+		}
 		Ticks();
 	}
-	static DWORD Sync()
+	static DWORD Sync_RT()
 	{
 		DWORD lastTicks, currentTicks;
 		LARGE_INTEGER counter;
@@ -56,6 +73,24 @@ public:
 
 		return (currentTicks > lastTicks) ? currentTicks - lastTicks : 0;
 	}
+	static DWORD Sync_SLP()
+	{
+		LARGE_INTEGER counter;
+		QueryPerformanceCounter(&counter);
+		double millis_current = (double)counter.QuadPart / TIME_Frequency;
+		double millis_delta = millis_current - TIME_Ticks;
+		if (TIME_Frametime <= millis_delta)
+		{
+			TIME_Ticks = millis_current;
+			return 1;
+		}
+		else if (TIME_Frametime - millis_delta > 2.0) // > 2ms
+			Sleep(1); // Sleep for ~1ms
+		else
+			Sleep(0); // yield thread's time-slice (does not actually sleep)
+
+		return 0;
+	}
 
 private:
 	static void Ticks()
@@ -66,35 +101,84 @@ private:
 	}
 };
 
+FrameLimiter::FPSLimitMode mFPSLimitMode = FrameLimiter::FPSLimitMode::FPS_NONE;
+
 HRESULT m_IDirect3DDevice8::Present(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion)
 {
-	if (bFPSLimit)
-		while (!FrameLimiter::Sync());
+	if (mFPSLimitMode == FrameLimiter::FPSLimitMode::FPS_REALTIME)
+		while (!FrameLimiter::Sync_RT());
+	else if (mFPSLimitMode == FrameLimiter::FPSLimitMode::FPS_ACCURATE)
+		while (!FrameLimiter::Sync_SLP());
 
 	return ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
 }
 
 void ForceWindowed(D3DPRESENT_PARAMETERS* pPresentationParameters)
 {
-	HMONITOR monitor = MonitorFromWindow(GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
+	HWND hwnd = pPresentationParameters->hDeviceWindow ? pPresentationParameters->hDeviceWindow : g_hFocusWindow;
+	HMONITOR monitor = MonitorFromWindow((!bUsePrimaryMonitor && hwnd) ? hwnd : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
 	MONITORINFO info;
 	info.cbSize = sizeof(MONITORINFO);
 	GetMonitorInfo(monitor, &info);
 	int DesktopResX = info.rcMonitor.right - info.rcMonitor.left;
 	int DesktopResY = info.rcMonitor.bottom - info.rcMonitor.top;
 
-	int left = (int)(((float)DesktopResX / 2.0f) - ((float)pPresentationParameters->BackBufferWidth / 2.0f));
-	int top = (int)(((float)DesktopResY / 2.0f) - ((float)pPresentationParameters->BackBufferHeight / 2.0f));
+	int left = (int)info.rcMonitor.left;
+	int top = (int)info.rcMonitor.top;
 
-	pPresentationParameters->Windowed = true;
+	if (!bBorderlessFullscreen)
+	{
+		left += (int)(((float)DesktopResX / 2.0f) - ((float)pPresentationParameters->BackBufferWidth / 2.0f));
+		top += (int)(((float)DesktopResY / 2.0f) - ((float)pPresentationParameters->BackBufferHeight / 2.0f));
+	}
 
-	SetWindowPos(pPresentationParameters->hDeviceWindow, HWND_NOTOPMOST, left, top, pPresentationParameters->BackBufferWidth, pPresentationParameters->BackBufferHeight, SWP_SHOWWINDOW);
+	pPresentationParameters->Windowed = 1;
+
+	// These must be set to default (0) on windowed mode as per spec to prevent app freezing
+	pPresentationParameters->FullScreen_RefreshRateInHz = D3DPRESENT_RATE_DEFAULT;
+	pPresentationParameters->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
+
+	if (hwnd != NULL)
+	{
+		UINT uFlags = SWP_SHOWWINDOW;
+		if (bBorderlessFullscreen)
+		{
+			LONG lOldStyle = GetWindowLong(hwnd, GWL_STYLE);
+			LONG lOldExStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+			LONG lNewStyle = lOldStyle & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZE | WS_MAXIMIZE | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_DLGFRAME);
+			lNewStyle |= (lOldStyle & WS_CHILD) ? 0 : WS_POPUP;
+			LONG lNewExStyle = lOldExStyle & ~(WS_EX_CONTEXTHELP | WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE | WS_EX_TOOLWINDOW);
+			lNewExStyle |= WS_EX_APPWINDOW;
+
+			if (lNewStyle != lOldStyle)
+			{
+				SetWindowLong(hwnd, GWL_STYLE, lNewStyle);
+				uFlags |= SWP_FRAMECHANGED;
+			}
+			if (lNewExStyle != lOldExStyle)
+			{
+				SetWindowLong(hwnd, GWL_EXSTYLE, lNewExStyle);
+				uFlags |= SWP_FRAMECHANGED;
+			}
+			SetWindowPos(hwnd, bAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, left, top, DesktopResX, DesktopResY, uFlags);
+		}
+		else
+		{
+			if (!bCenterWindow)
+				uFlags |= SWP_NOMOVE;
+
+			SetWindowPos(hwnd, bAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, left, top, pPresentationParameters->BackBufferWidth, pPresentationParameters->BackBufferHeight, uFlags);
+		}
+	}
 }
 
 HRESULT m_IDirect3D8::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow, DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters, IDirect3DDevice8** ppReturnedDeviceInterface)
 {
 	if (bForceWindowedMode)
+	{
+		g_hFocusWindow = hFocusWindow;
 		ForceWindowed(pPresentationParameters);
+	}
 
 	HRESULT hr = ProxyInterface->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
 
@@ -144,11 +228,22 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			bForceWindowedMode = GetPrivateProfileInt("MAIN", "ForceWindowedMode", 0, path) != 0;
 			bDirect3D8DisableMaximizedWindowedModeShim = GetPrivateProfileInt("MAIN", "Direct3D8DisableMaximizedWindowedModeShim", 0, path) != 0;
 			fFPSLimit = static_cast<float>(GetPrivateProfileInt("MAIN", "FPSLimit", 0, path));
+			bUsePrimaryMonitor = GetPrivateProfileInt("FORCEWINDOWED", "UsePrimaryMonitor", 0, path) != 0;
+			bCenterWindow = GetPrivateProfileInt("FORCEWINDOWED", "CenterWindow", 1, path) != 0;
+			bBorderlessFullscreen = GetPrivateProfileInt("FORCEWINDOWED", "BorderlessFullscreen", 0, path) != 0;
+			bAlwaysOnTop = GetPrivateProfileInt("FORCEWINDOWED", "AlwaysOnTop", 0, path) != 0;
+
 			if (fFPSLimit > 0.0f)
 			{
-				FrameLimiter::Init();
-				bFPSLimit = true;
+				FrameLimiter::FPSLimitMode mode = (GetPrivateProfileInt("MAIN", "FPSLimitMode", 1, path) == 2) ? FrameLimiter::FPSLimitMode::FPS_ACCURATE : FrameLimiter::FPSLimitMode::FPS_REALTIME;
+				if (mode == FrameLimiter::FPSLimitMode::FPS_ACCURATE)
+					timeBeginPeriod(1);
+
+				FrameLimiter::Init(mode);
+				mFPSLimitMode = mode;
 			}
+			else
+				mFPSLimitMode = FrameLimiter::FPSLimitMode::FPS_NONE;
 
 			if (bDirect3D8DisableMaximizedWindowedModeShim)
 			{
@@ -160,13 +255,16 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 					*(unsigned*)(addr + 6) = 0;
 					*(unsigned*)(*(unsigned*)(addr + 2)) = 0;
 					VirtualProtect((LPVOID)(addr + 6), 4, Protect, &Protect);
-					bForceWindowedMode = 0;
+					bForceWindowedMode = false;
 				}
 			}
 		}
 		break;
 		case DLL_PROCESS_DETACH:
 		{
+			if (mFPSLimitMode == FrameLimiter::FPSLimitMode::FPS_ACCURATE)
+				timeEndPeriod(1);
+
 			FreeLibrary(d3d8dll);
 		}
 		break;
